@@ -1,0 +1,224 @@
+openapi: 3.0.3
+info:
+  title: Rates Service
+  description: |
+    Сервис котировок валютных курсов с асинхронным обновлением.
+
+    Клиент создаёт запрос на обновление котировки (`POST /quotes`) и сразу
+    получает его идентификатор. Обновление выполняется в фоновом режиме:
+    сервис обращается к внешнему источнику цен и сохраняет результат.
+    Статус запроса проверяется через `GET /quotes/requests/{id}`,
+    последнее известное значение котировки — через `GET /quotes?pair=BASE/QUOTE`.
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080
+    description: локальный запуск
+tags:
+  - name: quotes
+    description: Котировки и запросы на их обновление
+  - name: service
+    description: Служебные эндпоинты
+paths:
+  /quotes:
+    post:
+      tags: [quotes]
+      operationId: createQuoteUpdate
+      summary: Запросить обновление котировки
+      description: |
+        Создаёт запрос на фоновое обновление котировки пары и сразу
+        возвращает его идентификатор (`202 Accepted`).
+
+        Идемпотентность:
+        - повторный вызов с тем же заголовком `Idempotency-Key` возвращает
+          тот же запрос (`200 OK`);
+        - если у пары уже есть незавершённый (`pending`) запрос, возвращается
+          он (`200 OK`), дубликат не создаётся.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUpdateRequest'
+            examples:
+              eurMxn:
+                summary: обновление EUR/MXN
+                value:
+                  pair: EUR/MXN
+      responses:
+        '202':
+          description: Запрос на обновление создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateRequest'
+        '200':
+          description: Вернулся уже существующий запрос (идемпотентность)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateRequest'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          $ref: '#/components/responses/UnsupportedPair'
+        '500':
+          $ref: '#/components/responses/Internal'
+    get:
+      tags: [quotes]
+      operationId: getLatestQuote
+      summary: Последнее значение котировки
+      parameters:
+        - name: pair
+          in: query
+          required: true
+          description: Код валютной пары в формате BASE/QUOTE
+          schema:
+            type: string
+          example: EUR/MXN
+      responses:
+        '200':
+          description: Последнее известное значение котировки
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Quote'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnsupportedPair'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /quotes/requests/{id}:
+    get:
+      tags: [quotes]
+      operationId: getQuoteUpdateRequest
+      summary: Статус запроса на обновление по идентификатору
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: 5f0c9e2a-1b7c-4a5e-9d3f-2c6b8a1e4d7f
+      responses:
+        '200':
+          description: Текущий статус запроса
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateRequest'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /healthz:
+    get:
+      tags: [service]
+      operationId: healthz
+      summary: Проверка живости (пинг БД)
+      responses:
+        '200':
+          description: Сервис и БД доступны
+        '503':
+          description: БД недоступна
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Ключ идемпотентности клиента
+      schema:
+        type: string
+  responses:
+    BadRequest:
+      description: Некорректный запрос
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UnsupportedPair:
+      description: Валютная пара не поддерживается
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Не найдено
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Internal:
+      description: Внутренняя ошибка
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    CreateUpdateRequest:
+      type: object
+      required: [pair]
+      properties:
+        pair:
+          type: string
+          description: Код валютной пары в формате BASE/QUOTE
+          example: EUR/MXN
+    UpdateRequest:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        pair:
+          type: string
+          example: EUR/MXN
+        status:
+          type: string
+          enum: [pending, completed, failed]
+        price:
+          type: number
+          format: double
+          nullable: true
+          description: Значение цены; заполнено при status=completed
+        error:
+          type: string
+          nullable: true
+          description: Причина ошибки; заполнено при status=failed
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Quote:
+      type: object
+      properties:
+        pair:
+          type: string
+          example: EUR/MXN
+        price:
+          type: number
+          format: double
+        updated_at:
+          type: string
+          format: date-time
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              example: invalid_pair
+            message:
+              type: string
+              example: "invalid currency pair: ожидается формат BASE/QUOTE, получено \"EURMXN\""
