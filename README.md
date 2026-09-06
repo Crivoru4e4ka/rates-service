@@ -43,7 +43,7 @@ docker compose up -d --build
 - OpenAPI-спека: http://localhost:8080/openapi.yaml
 - Метрики: http://localhost:8080/metrics
 - Версия: http://localhost:8080/version
-- Smoke-тест: `./scripts/smoke.ps1` (Windows) / `./scripts/smoke.sh` (POSIX)
+- Smoke-тест: `./scripts/smoke.ps1`
 
 Postgres проброшен на хост как `localhost:5433` (5432 часто занят локальной
 службой PostgreSQL).
@@ -257,7 +257,7 @@ erDiagram
 ## Тесты
 
 ```bash
-make test            # или go test ./...
+go test ./...
 ```
 
 Unit-тесты интеграционные пропускают без `TEST_DATABASE_URL`; CI поднимает
