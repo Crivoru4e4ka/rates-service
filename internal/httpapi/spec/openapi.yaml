@@ -49,6 +49,15 @@ paths:
       responses:
         '202':
           description: Запрос на обновление создан
+          headers:
+            Location:
+              description: URL статуса запроса (/quotes/requests/{id})
+              schema:
+                type: string
+            X-Request-ID:
+              description: Идентификатор запроса для корреляции в логах
+              schema:
+                type: string
           content:
             application/json:
               schema:
@@ -128,6 +137,18 @@ paths:
           description: Сервис и БД доступны
         '503':
           description: БД недоступна
+  /version:
+    get:
+      tags: [service]
+      operationId: version
+      summary: Версия сервиса
+      responses:
+        '200':
+          description: Информация о сборке
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Version'
 components:
   parameters:
     IdempotencyKey:
@@ -210,6 +231,17 @@ components:
         updated_at:
           type: string
           format: date-time
+    Version:
+      type: object
+      properties:
+        version:
+          type: string
+          description: Версия сборки (задаётся ldflags при сборке образа)
+          example: dev
+        go:
+          type: string
+          description: Версия Go, которой собран бинарник
+          example: go1.25.1
     Error:
       type: object
       properties:

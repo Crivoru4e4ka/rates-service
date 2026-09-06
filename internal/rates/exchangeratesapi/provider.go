@@ -100,17 +100,22 @@ func (p *Provider) Rate(ctx context.Context, pair domain.Pair) (rates.Rate, erro
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return rates.Rate{}, fmt.Errorf("exchangeratesapi: запрос %s: %w", redact(endpoint.String(), p.apiKey), err)
+		return rates.Rate{}, rates.Transient(fmt.Errorf("exchangeratesapi: запрос %s: %w",
+			redact(endpoint.String(), p.apiKey), err), 0)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return rates.Rate{}, fmt.Errorf("exchangeratesapi: читать ответ: %w", err)
+		return rates.Rate{}, rates.Transient(fmt.Errorf("exchangeratesapi: читать ответ: %w", err), 0)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return rates.Rate{}, fmt.Errorf("exchangeratesapi: неожиданный статус %d: %s", resp.StatusCode, snippet(body))
+		err := fmt.Errorf("exchangeratesapi: неожиданный статус %d: %s", resp.StatusCode, snippet(body))
+		if transientStatus(resp.StatusCode) {
+			return rates.Rate{}, rates.Transient(err, rates.RetryAfterFromHeader(resp.Header, time.Now()))
+		}
+		return rates.Rate{}, err
 	}
 
 	var lr latestResponse
@@ -125,7 +130,7 @@ func (p *Provider) Rate(ctx context.Context, pair domain.Pair) (rates.Rate, erro
 		return rates.Rate{}, errors.New("exchangeratesapi: в ответе нет success=true и нет rates")
 	}
 
-	price, err := crossPrice(lr.Base, lr.Rates, pair)
+	price, err := rates.CrossPrice(lr.Base, lr.Rates, pair)
 	if err != nil {
 		return rates.Rate{}, fmt.Errorf("exchangeratesapi: %w", err)
 	}
@@ -138,24 +143,11 @@ func (p *Provider) Rate(ctx context.Context, pair domain.Pair) (rates.Rate, erro
 	}, nil
 }
 
-// crossPrice вычисляет цену пары из курсов ответа против анкора:
-// price(BASE/QUOTE) = R[QUOTE] / R[BASE].
-func crossPrice(anchor string, vs map[string]float64, pair domain.Pair) (float64, error) {
-	m := make(map[string]float64, len(vs)+1)
-	for c, v := range vs {
-		m[strings.ToUpper(c)] = v
-	}
-	m[strings.ToUpper(anchor)] = 1
-
-	base, okBase := m[pair.Base]
-	quote, okQuote := m[pair.Quote]
-	if !okBase || !okQuote {
-		return 0, fmt.Errorf("в ответе нет курсов для пары %s", pair.String())
-	}
-	if base <= 0 || quote <= 0 {
-		return 0, fmt.Errorf("некорректные курсы в ответе: %s=%v, %s=%v", pair.Base, base, pair.Quote, quote)
-	}
-	return quote / base, nil
+// transientStatus — статусы, при которых имеет смысл повторить запрос.
+func transientStatus(code int) bool {
+	return code == http.StatusTooManyRequests ||
+		code == http.StatusForbidden ||
+		code >= 500
 }
 
 // pairSymbols — список валют пары (без анкора) для параметра symbols.

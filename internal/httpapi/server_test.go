@@ -51,7 +51,7 @@ func (f *fakeService) Ping(ctx context.Context) error { return f.pingErr }
 
 func testServer(t *testing.T, svc Service) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(New(svc, nil).Handler())
+	srv := httptest.NewServer(New(svc, nil, Options{}).Handler())
 	t.Cleanup(srv.Close)
 	return srv
 }

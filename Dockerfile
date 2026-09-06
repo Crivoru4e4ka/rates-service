@@ -1,9 +1,12 @@
 FROM golang:1.25-alpine AS build
+ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /bin/rates ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+    -ldflags="-s -w -X main.version=${VERSION}" \
+    -o /bin/rates ./cmd/server
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates wget

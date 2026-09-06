@@ -9,10 +9,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	_ "net/http/pprof" // регистрирует pprof-хендлеры на DefaultServeMux
+	"runtime"
 	"strings"
 	"time"
 
 	"plata-rates/internal/domain"
+	"plata-rates/internal/metrics"
 )
 
 //go:embed spec/openapi.yaml
@@ -32,21 +35,31 @@ type Service interface {
 type Server struct {
 	service Service
 	logger  *slog.Logger
+	version string
+	metrics *metrics.Metrics
 	handler http.Handler
 }
 
+// Options — параметры HTTP-сервера.
+type Options struct {
+	Version string           // версия сборки (ldflags -X main.version)
+	Metrics *metrics.Metrics // счётчики; nil — /metrics не поднимается
+	Pprof   bool             // поднимать /debug/pprof
+}
+
 // New собирает маршруты и оборачивает их middleware.
-func New(svc Service, logger *slog.Logger) *Server {
+func New(svc Service, logger *slog.Logger, opts Options) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{service: svc, logger: logger}
+	s := &Server{service: svc, logger: logger, version: opts.Version, metrics: opts.Metrics}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/swagger/", http.StatusFound)
 	})
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /version", s.handleVersion)
 	mux.HandleFunc("POST /quotes", s.handleCreateUpdate)
 	mux.HandleFunc("GET /quotes/requests/{id}", s.handleGetRequest)
 	mux.HandleFunc("GET /quotes", s.handleGetQuote)
@@ -55,8 +68,15 @@ func New(svc Service, logger *slog.Logger) *Server {
 		http.Redirect(w, r, "/swagger/", http.StatusMovedPermanently)
 	})
 	mux.HandleFunc("GET /swagger/", s.handleSwaggerUI)
+	if opts.Metrics != nil {
+		mux.Handle("GET /metrics", opts.Metrics.Handler())
+	}
+	if opts.Pprof {
+		// pprof-хендлеры зарегистрированы на DefaultServeMux blank-импортом.
+		mux.Handle("GET /debug/pprof/", http.DefaultServeMux)
+	}
 
-	s.handler = withRecovery(withRequestLog(mux, logger), logger)
+	s.handler = withRecovery(withRequestLog(withRequestID(mux), logger, opts.Metrics), logger)
 	return s
 }
 
@@ -88,6 +108,11 @@ type updateRequestResponse struct {
 type apiError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+type versionResponse struct {
+	Version string `json:"version"`
+	Go      string `json:"go"`
 }
 
 type errorResponse struct {
@@ -127,6 +152,9 @@ func (s *Server) handleCreateUpdate(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusAccepted
 	if !created {
 		status = http.StatusOK // вернулся существующий запрос (идемпотентность)
+	} else {
+		// REST-удобство: клиент сразу получает адрес статуса запроса.
+		w.Header().Set("Location", "/quotes/requests/"+req.ID)
 	}
 	writeJSON(w, status, updateRequestResponse{
 		ID:        req.ID,
@@ -187,6 +215,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleVersion — GET /version: информация о сборке.
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, versionResponse{
+		Version: s.version,
+		Go:      runtime.Version(),
+	})
 }
 
 // handleOpenAPISpec — GET /openapi.yaml.

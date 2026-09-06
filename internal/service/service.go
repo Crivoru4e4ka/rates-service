@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"plata-rates/internal/domain"
+	"plata-rates/internal/metrics"
 	"plata-rates/internal/rates"
 )
 
@@ -34,6 +35,7 @@ type Options struct {
 	RequestTimeout time.Duration // таймаут обращения к провайдеру
 	ResyncInterval time.Duration // период повторной постановки pending-запросов
 	Logger         *slog.Logger
+	Metrics        *metrics.Metrics // счётчики (nil — без метрик)
 }
 
 type Service struct {
@@ -42,9 +44,11 @@ type Service struct {
 	allowed  map[string]struct{}
 	opts     Options
 	logger   *slog.Logger
+	metrics  *metrics.Metrics
 
 	queue        chan domain.UpdateRequest
 	workersWG    sync.WaitGroup
+	shutdownOnce sync.Once
 	resyncCtx    context.Context
 	resyncCancel context.CancelFunc
 	resyncWG     sync.WaitGroup
@@ -80,6 +84,7 @@ func New(repo Repo, provider rates.Provider, supportedCurrencies []string, opts 
 		allowed:  allowed,
 		opts:     opts,
 		logger:   opts.Logger,
+		metrics:  opts.Metrics,
 		queue:    make(chan domain.UpdateRequest, opts.QueueSize),
 	}
 	s.resyncCtx, s.resyncCancel = context.WithCancel(context.Background())
@@ -141,23 +146,30 @@ func (s *Service) Ping(ctx context.Context) error {
 	return s.repo.Ping(ctx)
 }
 
-// Shutdown останавливает фоновые воркеры. Новые задачи не принимаются,
-// принятые дожидаемся в пределах ctx.
-func (s *Service) Shutdown(ctx context.Context) {
-	s.resyncCancel()
-	s.resyncWG.Wait() // сначала завершаем resync, чтобы не было гонки с close(s.queue)
-	close(s.queue)
+// QueueLength — текущая длина очереди обновлений (для метрик).
+func (s *Service) QueueLength() int {
+	return len(s.queue)
+}
 
-	done := make(chan struct{})
-	go func() {
-		s.workersWG.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-ctx.Done():
-		s.logger.Warn("shutdown: часть запросов могла остаться в статусе pending", "err", ctx.Err())
-	}
+// Shutdown останавливает фоновые воркеры. Новые задачи не принимаются,
+// принятые дожидаемся в пределах ctx. Повторный вызов безопасен.
+func (s *Service) Shutdown(ctx context.Context) {
+	s.shutdownOnce.Do(func() {
+		s.resyncCancel()
+		s.resyncWG.Wait() // сначала завершаем resync, чтобы не было гонки с close(s.queue)
+		close(s.queue)
+
+		done := make(chan struct{})
+		go func() {
+			s.workersWG.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			s.logger.Warn("shutdown: часть запросов могла остаться в статусе pending", "err", ctx.Err())
+		}
+	})
 }
 
 func (s *Service) isSupported(p domain.Pair) bool {
@@ -198,13 +210,16 @@ func (s *Service) process(req domain.UpdateRequest) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.opts.RequestTimeout)
 	defer cancel()
 
+	start := time.Now()
 	rate, err := s.provider.Rate(ctx, req.Pair)
+	s.metrics.ObserveProvider(time.Since(start), err)
 	if err != nil {
 		bgCtx, bgCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer bgCancel()
 		if ferr := s.repo.FailUpdateRequest(bgCtx, req.ID, err.Error()); ferr != nil {
 			s.logger.Error("не пометить запрос как failed", "id", req.ID, "err", ferr)
 		}
+		s.metrics.ObserveUpdate("failed")
 		s.logger.Warn("обновление котировки не удалось", "id", req.ID, "pair", req.Pair.String(), "err", err)
 		return
 	}
@@ -216,6 +231,7 @@ func (s *Service) process(req domain.UpdateRequest) {
 		if ferr := s.repo.FailUpdateRequest(bgCtx, req.ID, err.Error()); ferr != nil {
 			s.logger.Error("не пометить запрос как failed", "id", req.ID, "err", ferr)
 		}
+		s.metrics.ObserveUpdate("failed")
 		s.logger.Error("не сохранить котировку", "id", req.ID, "pair", req.Pair.String(), "err", err)
 		return
 	}
@@ -223,6 +239,7 @@ func (s *Service) process(req domain.UpdateRequest) {
 		s.logger.Error("не пометить запрос как completed", "id", req.ID, "err", err)
 		return
 	}
+	s.metrics.ObserveUpdate("completed")
 	s.logger.Info("котировка обновлена", "id", req.ID, "pair", req.Pair.String(), "price", rate.Price)
 }
 

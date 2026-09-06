@@ -368,3 +368,71 @@ func TestGetUpdateRequest_InvalidID(t *testing.T) {
 		t.Fatalf("err = %v, want ErrInvalidID", err)
 	}
 }
+
+// blockingProvider «зависает» внутри Rate, пока тест не разрешит продолжить.
+type blockingProvider struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingProvider) Rate(ctx context.Context, pair domain.Pair) (rates.Rate, error) {
+	f.once.Do(func() { close(f.entered) })
+	select {
+	case <-f.release:
+		return rates.Rate{Pair: pair, Price: 1, Source: "blocking"}, nil
+	case <-ctx.Done():
+		return rates.Rate{}, ctx.Err()
+	}
+}
+
+func TestShutdown_WaitsForInFlightRequest(t *testing.T) {
+	repo := newFakeRepo()
+	prov := &blockingProvider{entered: make(chan struct{}), release: make(chan struct{})}
+
+	svc := New(repo, prov, testCurrencies, Options{
+		QueueSize:      10,
+		Workers:        1,
+		RequestTimeout: 5 * time.Second,
+		ResyncInterval: time.Hour,
+	})
+	t.Cleanup(func() { svc.Shutdown(context.Background()) }) // Shutdown идемпотентен
+
+	req, _, err := svc.CreateUpdateRequest(context.Background(), "EUR/MXN", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-prov.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("воркер не начал обработку")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		svc.Shutdown(context.Background())
+		close(done)
+	}()
+
+	// Shutdown не должен завершиться, пока воркер в полёте.
+	select {
+	case <-done:
+		t.Fatal("shutdown завершился до окончания обработки")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(prov.release)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("shutdown не завершился после освобождения воркера")
+	}
+
+	repo.mu.Lock()
+	status := repo.requests[req.ID].Status
+	repo.mu.Unlock()
+	if status != domain.StatusCompleted {
+		t.Fatalf("status = %v, want completed", status)
+	}
+}

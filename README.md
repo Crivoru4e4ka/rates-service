@@ -2,24 +2,32 @@
 
 Тестовое задание Plata (Go Engineer): асинхронный сервис котировок на Go.
 
+[![CI](https://github.com/Crivoru4e4ka/rates-service/actions/workflows/ci.yml/badge.svg)](https://github.com/Crivoru4e4ka/rates-service/actions/workflows/ci.yml)
+
 Пользователь запрашивает обновление котировки (`POST /quotes`), сервис сразу
 возвращает идентификатор запроса и **в фоновом режиме** получает цену у
-внешнего источника (exchangeratesapi.io) и сохраняет её в PostgreSQL.
-Позже клиент может узнать статус запроса (`GET /quotes/requests/{id}`)
-или получить последнее значение котировки (`GET /quotes?pair=EUR/MXN`).
+внешнего источника и сохраняет её в PostgreSQL. Позже клиент может узнать
+статус запроса (`GET /quotes/requests/{id}`) или получить последнее значение
+котировки (`GET /quotes?pair=EUR/MXN`).
 
 ## Возможности
 
 - HTTP API в формате JSON (стандартный `net/http`, роутинг Go 1.22+)
+- Сменные провайдеры котировок: **frankfurter.dev** (курсы ЕЦБ, без ключа,
+  по умолчанию) и **exchangeratesapi.io** (с ключом) — выбор через `RATES_PROVIDER`
+- Resilience-слой вокруг провайдера: повторы с экспоненциальным backoff и
+  джиттером для 429/403/5xx, уважение `Retry-After`, глобальный rate-limiter
 - Фоновое обновление: пул воркеров + очередь в памяти, повторный подбор
   pending-запросов (устойчиво к переполнению очереди и рестарту)
-- Идемпотентность: заголовок `Idempotency-Key` и дедупликация pending-запросов по паре
+- Идемпотентность: заголовок `Idempotency-Key` и дедупликация pending-запросов
+  по паре — обе на unique-индексах PostgreSQL, т.е. безопасны под гонками
 - PostgreSQL (pgx/v5) + встроенные идемпотентные миграции при старте
-- Кросс-курсы: запрос к внешнему API выполняется с `base=EUR`, цена произвольной
-  пары вычисляется из ответа — работает даже на тарифах с фиксированной базовой валютой
-- Graceful shutdown, структурированные логи (`slog`), `/healthz` с пингом БД
-- Docker + docker-compose, OpenAPI 3.0.3 + Swagger UI
-- Unit-тесты + интеграционные тесты хранилища
+- Наблюдаемость: `/healthz` (пинг БД), `/metrics` (формат Prometheus),
+  `/version`, `X-Request-ID` в ответах и логах, `/debug/pprof` по флагу
+- Graceful shutdown, структурированные логи (`slog`)
+- Docker + docker-compose с healthcheck'ами, OpenAPI 3.0.3 + Swagger UI
+- Unit-тесты + интеграционные тесты хранилища; CI (golangci-lint, `go test -race`
+  с Postgres-сервис-контейнером, сборка образа)
 
 ## Быстрый старт (Docker)
 
@@ -33,6 +41,9 @@ docker compose up -d --build
 - API: http://localhost:8080
 - Swagger UI: http://localhost:8080/swagger/
 - OpenAPI-спека: http://localhost:8080/openapi.yaml
+- Метрики: http://localhost:8080/metrics
+- Версия: http://localhost:8080/version
+- Smoke-тест: `./scripts/smoke.ps1` (Windows) / `./scripts/smoke.sh` (POSIX)
 
 Postgres проброшен на хост как `localhost:5433` (5432 часто занят локальной
 службой PostgreSQL).
@@ -59,14 +70,20 @@ DATABASE_URL=postgres://... RATES_API_KEY=... go run ./cmd/server
 |---|---|---|
 | `HTTP_ADDR` | `:8080` | адрес HTTP-сервера |
 | `DATABASE_URL` | `postgres://rates:rates@localhost:5432/rates?sslmode=disable` | подключение к PostgreSQL |
-| `RATES_API_URL` | `https://api.exchangeratesapi.io/v1` | базовый URL внешнего API |
-| `RATES_API_KEY` | — | access_key для exchangeratesapi.io |
-| `RATES_PROVIDER_TIMEOUT` | `5s` | таймаут обращения к внешнему API |
+| `RATES_PROVIDER` | `frankfurter` | провайдер котировок: `frankfurter` или `exchangeratesapi` |
+| `RATES_API_URL` | по провайдеру | базовый URL API (`https://api.frankfurter.dev/v1` / `https://api.exchangeratesapi.io/v1`) |
+| `RATES_API_KEY` | — | access_key (нужен только для `exchangeratesapi`) |
+| `RATES_PROVIDER_TIMEOUT` | `5s` | таймаут одного вызова провайдера |
+| `PROVIDER_MAX_ATTEMPTS` | `3` | попыток вызова провайдера (включая первую) |
+| `PROVIDER_RETRY_BASE_DELAY` | `500ms` | базовая задержка между попытками (экспоненциальный backoff) |
+| `PROVIDER_RETRY_MAX_DELAY` | `10s` | потолок задержки между попытками |
+| `PROVIDER_MIN_INTERVAL` | `1s` | минимальный интервал между вызовами провайдера (глобально) |
 | `SUPPORTED_CURRENCIES` | `USD,EUR,MXN` | допустимые валюты пар |
 | `WORKERS` | `4` | число фоновых воркеров |
 | `QUEUE_SIZE` | `1024` | размер очереди обновлений |
 | `RESYNC_INTERVAL` | `30s` | период повторной постановки pending-запросов |
 | `SHUTDOWN_TIMEOUT` | `15s` | время на graceful shutdown |
+| `PPROF_ENABLED` | `false` | поднимать `/debug/pprof` |
 | `LOG_LEVEL` | `info` | debug / info / warn / error |
 | `LOG_FORMAT` | `text` | text / json |
 
@@ -143,11 +160,108 @@ internal/storage/postgres       — pgx-репозиторий + встроен�
 рестарте pending-запросы переотправляются в очередь (`RESYNC_INTERVAL`,
 а также при старте сервиса).
 
+## Наблюдаемость
+
+- `GET /healthz` — пинг БД (для healthcheck'ов compose/K8s)
+- `GET /version` — версия сборки (задаётся ldflags при сборке образа)
+- `GET /metrics` — счётчики в формате Prometheus: HTTP-запросы по route/коду,
+  итоги обновлений (completed/failed), вызовы провайдера (ok/error), суммарная
+  длительность вызовов провайдера, длина очереди
+- `X-Request-ID` — эхо в каждом ответе и поле `request_id` в логах
+  (принимается от клиента или генерируется)
+- `/debug/pprof` — поднимается при `PPROF_ENABLED=1`
+
+## Архитектурные решения и trade-offs
+
+**Каналы вместо очереди в БД.** Для single-instance — минимум инфраструктуры
+и полный контроль backpressure. Слабое место in-memory очереди (потеря задач
+при рестарте) закрыто: источник истины — таблица `update_requests`, при старте
+и по тикеру pending-запросы переотправляются в очередь. При нескольких
+инстансах очередь в памяти — первое, что нужно заменить
+(`FOR UPDATE SKIP LOCKED` или брокер); идемпотентность при этом не пострадает —
+она на unique-индексах БД.
+
+**Кросс-курсы от анкора.** Бесплатный тариф exchangeratesapi.io фиксирует
+базовую валюту, поэтому цена произвольной пары считается из курсов против
+базы ответа: `price(BASE/QUOTE) = R[QUOTE] / R[BASE]`. Формула не зависит от
+того, какую базу вернул API, и покрыта тестами. Trade-off — лишнее деление
+(погрешность незначима для отображения котировок). Именно поэтому дефолтным
+провайдером стал **frankfurter.dev**: открытый API референсных курсов ЕЦБ
+без ключа и агрессивных лимитов, а exchangeratesapi.io остался опцией —
+он назван в ТЗ, и переключение делается переменной окружения.
+
+**Идемпотентность на уровне БД.** `Idempotency-Key` (unique-индекс) защищает
+от повторов клиента; частичный unique-индекс «одна pending-задача на пару» —
+от дублирования работы. Обе гарантии держатся даже при гонках и нескольких
+инстансах, потому что проверяет их СУБД, а не приложение.
+
+**422 вместо 400 для неподдерживаемой пары.** 400 — запрос некорректен по
+форме (битый JSON, кривой формат пары); 422 — форма верна, но нарушено
+бизнес-правило (валюта вне whitelist). Клиент может программно различить
+«чинить формат» и «чинить список валют».
+
+**Resilience-слой вокруг провайдера.** Внешние API котировок имеют лимиты и
+WAF-защиту: обёртка `rates/resilient` добавляет глобальное ограничение частоты
+(`PROVIDER_MIN_INTERVAL`), повторные попытки с экспоненциальным backoff и
+джиттером для 429/403/5xx и уважение `Retry-After`. Запрос переводится в
+`failed` только после исчерпания попыток — клиент видит честную причину.
+
+**Чего сознательно нет.** Брокеров сообщений, кэшей, gRPC, OpenTelemetry —
+на этом масштабе они решают несуществующие проблемы и усложняют проверку
+задания. Точки роста описаны выше.
+
+## Диаграммы
+
+Асинхронное обновление котировки:
+
+```mermaid
+sequenceDiagram
+    participant C as Клиент
+    participant A as API
+    participant D as PostgreSQL
+    participant W as Воркер
+    participant P as Внешний API
+
+    C->>A: POST /quotes {"pair":"EUR/MXN"}
+    A->>D: INSERT update_requests (pending)
+    A-->>C: 202 {"id":"..."} + Location
+    A->>W: задача в канал очереди
+    W->>P: GET /latest?base=EUR&symbols=MXN
+    P-->>W: {"rates":{"MXN":19.62}}
+    W->>D: UPSERT quotes + UPDATE запрос (completed)
+    C->>A: GET /quotes/requests/{id}
+    A-->>C: 200 {"status":"completed","price":19.62}
+```
+
+Модель данных:
+
+```mermaid
+erDiagram
+    quotes {
+        text pair PK
+        numeric price
+        timestamptz updated_at
+    }
+    update_requests {
+        uuid id PK
+        text pair
+        text status "pending | completed | failed"
+        numeric price
+        text error
+        text idempotency_key UK
+        timestamptz created_at
+        timestamptz updated_at
+    }
+```
+
 ## Тесты
 
 ```bash
-go test ./...    # unit-тесты (интеграционные пропускаются без TEST_DATABASE_URL)
+make test            # или go test ./...
 ```
+
+Unit-тесты интеграционные пропускают без `TEST_DATABASE_URL`; CI поднимает
+Postgres-сервис-контейнер и гоняет их с `-race`.
 
 Интеграционные тесты хранилища на реальном PostgreSQL:
 

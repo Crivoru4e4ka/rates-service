@@ -16,10 +16,17 @@ import (
 
 	"plata-rates/internal/config"
 	"plata-rates/internal/httpapi"
+	"plata-rates/internal/metrics"
+	"plata-rates/internal/rates"
 	"plata-rates/internal/rates/exchangeratesapi"
+	"plata-rates/internal/rates/frankfurter"
+	"plata-rates/internal/rates/resilient"
 	"plata-rates/internal/service"
 	pgstorage "plata-rates/internal/storage/postgres"
 )
+
+// version задаётся при сборке: -ldflags "-X main.version=v1.0.0".
+var version = "dev"
 
 func main() {
 	if err := run(); err != nil {
@@ -57,10 +64,18 @@ func run() error {
 	logger.Info("миграции применены")
 
 	storage := pgstorage.New(pool)
-	provider := exchangeratesapi.New(cfg.RatesAPIURL, cfg.RatesAPIKey, cfg.ProviderTimeout, logger)
-	if cfg.RatesAPIKey == "" {
-		logger.Warn("RATES_API_KEY пуст: запросы на обновление будут завершаться ошибкой, пока ключ не задан")
-	}
+	m := metrics.New(cfg.Provider)
+
+	provider := newProvider(cfg, logger)
+	// Resilience: глобальное ограничение частоты вызовов + повторы с backoff
+	// для транзистентных ошибок (429/403/5xx, сеть).
+	provider = resilient.New(provider, resilient.Options{
+		MaxAttempts: cfg.ProviderMaxAttempts,
+		BaseDelay:   cfg.ProviderRetryBaseDelay,
+		MaxDelay:    cfg.ProviderRetryMaxDelay,
+		MinInterval: cfg.ProviderMinInterval,
+		Logger:      logger,
+	})
 
 	svc := service.New(storage, provider, cfg.SupportedCurrencies, service.Options{
 		QueueSize:      cfg.QueueSize,
@@ -68,9 +83,19 @@ func run() error {
 		RequestTimeout: cfg.ProviderTimeout,
 		ResyncInterval: cfg.ResyncInterval,
 		Logger:         logger,
+		Metrics:        m,
 	})
+	m.QueueLen = svc.QueueLength
 
-	api := httpapi.New(svc, logger)
+	if cfg.Provider == "exchangeratesapi" && cfg.RatesAPIKey == "" {
+		logger.Warn("RATES_API_KEY пуст: запросы на обновление будут завершаться ошибкой, пока ключ не задан")
+	}
+
+	api := httpapi.New(svc, logger, httpapi.Options{
+		Version: version,
+		Metrics: m,
+		Pprof:   cfg.PprofEnabled,
+	})
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           api.Handler(),
@@ -82,7 +107,8 @@ func run() error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("http-сервер запущен", "addr", cfg.HTTPAddr,
+		logger.Info("http-сервер запущен",
+			"addr", cfg.HTTPAddr, "version", version, "provider", cfg.Provider,
 			"swagger", "http://localhost"+cfg.HTTPAddr+"/swagger/")
 		errCh <- srv.ListenAndServe()
 	}()
@@ -104,6 +130,17 @@ func run() error {
 	svc.Shutdown(shCtx)
 	logger.Info("сервис остановлен")
 	return nil
+}
+
+// newProvider выбирает реализацию источника котировок по конфигурации.
+// Оба провайдера реализуют rates.Provider, поэтому замена — только конфигом.
+func newProvider(cfg config.Config, logger *slog.Logger) rates.Provider {
+	switch cfg.Provider {
+	case "exchangeratesapi":
+		return exchangeratesapi.New(cfg.RatesAPIURL, cfg.RatesAPIKey, cfg.ProviderTimeout, logger)
+	default: // frankfurter
+		return frankfurter.New(cfg.RatesAPIURL, cfg.ProviderTimeout, logger)
+	}
 }
 
 func newLogger(cfg config.Config) *slog.Logger {

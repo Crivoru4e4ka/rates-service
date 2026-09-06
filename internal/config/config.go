@@ -13,9 +13,15 @@ type Config struct {
 	HTTPAddr    string
 	DatabaseURL string
 
-	RatesAPIURL     string        // базовый URL провайдера, напр. https://api.exchangeratesapi.io/v1
-	RatesAPIKey     string        // access_key внешнего API
-	ProviderTimeout time.Duration // таймаут обращения к внешнему API и к БД в фоновых задачах
+	Provider        string        // frankfurter | exchangeratesapi
+	RatesAPIURL     string        // базовый URL провайдера
+	RatesAPIKey     string        // access_key (используется только exchangeratesapi)
+	ProviderTimeout time.Duration // таймаут одного вызова провайдера
+
+	ProviderMaxAttempts    int           // попыток вызова провайдера (включая первую)
+	ProviderRetryBaseDelay time.Duration // базовая задержка перед повтором
+	ProviderRetryMaxDelay  time.Duration // потолок задержки между повторами
+	ProviderMinInterval    time.Duration // минимальный интервал между вызовами провайдера (глобально)
 
 	SupportedCurrencies []string // допустимые валюты пар, напр. USD,EUR,MXN
 
@@ -28,34 +34,64 @@ type Config struct {
 	HTTPIdleTimeout  time.Duration
 	ShutdownTimeout  time.Duration
 
+	PprofEnabled bool // поднимать /debug/pprof
+
 	LogLevel  string // debug|info|warn|error
 	LogFormat string // text|json
 }
 
 // Load читает конфигурацию из окружения, подставляя значения по умолчанию.
 func Load() (Config, error) {
+	provider := strings.ToLower(env("RATES_PROVIDER", "frankfurter"))
+	var defaultURL string
+	switch provider {
+	case "frankfurter":
+		defaultURL = "https://api.frankfurter.dev/v1"
+	case "exchangeratesapi":
+		defaultURL = "https://api.exchangeratesapi.io/v1"
+	default:
+		return Config{}, fmt.Errorf(
+			"RATES_PROVIDER: неизвестный провайдер %q (допустимо: frankfurter, exchangeratesapi)", provider)
+	}
+
 	cfg := Config{
-		HTTPAddr:            env("HTTP_ADDR", ":8080"),
-		DatabaseURL:         env("DATABASE_URL", "postgres://rates:rates@localhost:5432/rates?sslmode=disable"),
-		RatesAPIURL:         env("RATES_API_URL", "https://api.exchangeratesapi.io/v1"),
-		RatesAPIKey:         env("RATES_API_KEY", ""),
-		ProviderTimeout:     envDuration("RATES_PROVIDER_TIMEOUT", 5*time.Second),
+		HTTPAddr:    env("HTTP_ADDR", ":8080"),
+		DatabaseURL: env("DATABASE_URL", "postgres://rates:rates@localhost:5432/rates?sslmode=disable"),
+
+		Provider:        provider,
+		RatesAPIURL:     env("RATES_API_URL", defaultURL),
+		RatesAPIKey:     env("RATES_API_KEY", ""),
+		ProviderTimeout: envDuration("RATES_PROVIDER_TIMEOUT", 5*time.Second),
+
+		ProviderMaxAttempts:    envInt("PROVIDER_MAX_ATTEMPTS", 3),
+		ProviderRetryBaseDelay: envDuration("PROVIDER_RETRY_BASE_DELAY", 500*time.Millisecond),
+		ProviderRetryMaxDelay:  envDuration("PROVIDER_RETRY_MAX_DELAY", 10*time.Second),
+		ProviderMinInterval:    envDuration("PROVIDER_MIN_INTERVAL", 1*time.Second),
+
 		SupportedCurrencies: parseCurrencies(env("SUPPORTED_CURRENCIES", "USD,EUR,MXN")),
-		Workers:             envInt("WORKERS", 4),
-		QueueSize:           envInt("QUEUE_SIZE", 1024),
-		ResyncInterval:      envDuration("RESYNC_INTERVAL", 30*time.Second),
-		HTTPReadTimeout:     envDuration("HTTP_READ_TIMEOUT", 5*time.Second),
-		HTTPWriteTimeout:    envDuration("HTTP_WRITE_TIMEOUT", 10*time.Second),
-		HTTPIdleTimeout:     envDuration("HTTP_IDLE_TIMEOUT", 60*time.Second),
-		ShutdownTimeout:     envDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
-		LogLevel:            env("LOG_LEVEL", "info"),
-		LogFormat:           env("LOG_FORMAT", "text"),
+
+		Workers:        envInt("WORKERS", 4),
+		QueueSize:      envInt("QUEUE_SIZE", 1024),
+		ResyncInterval: envDuration("RESYNC_INTERVAL", 30*time.Second),
+
+		HTTPReadTimeout:  envDuration("HTTP_READ_TIMEOUT", 5*time.Second),
+		HTTPWriteTimeout: envDuration("HTTP_WRITE_TIMEOUT", 10*time.Second),
+		HTTPIdleTimeout:  envDuration("HTTP_IDLE_TIMEOUT", 60*time.Second),
+		ShutdownTimeout:  envDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
+
+		PprofEnabled: envBool("PPROF_ENABLED", false),
+
+		LogLevel:  env("LOG_LEVEL", "info"),
+		LogFormat: env("LOG_FORMAT", "text"),
 	}
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
 	}
 	if cfg.QueueSize < 1 {
 		cfg.QueueSize = 1
+	}
+	if cfg.ProviderMaxAttempts < 1 {
+		cfg.ProviderMaxAttempts = 1
 	}
 	if len(cfg.SupportedCurrencies) < 2 {
 		return Config{}, fmt.Errorf("SUPPORTED_CURRENCIES: нужно минимум две валюты, получено %q",
@@ -78,6 +114,14 @@ func envInt(key string, def int) int {
 		}
 	}
 	return def
+}
+
+func envBool(key string, def bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if v == "" {
+		return def
+	}
+	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
 func envDuration(key string, def time.Duration) time.Duration {
