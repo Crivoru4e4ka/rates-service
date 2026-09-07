@@ -83,6 +83,7 @@ type Metrics struct {
 	HTTPRequests  *counterVec // {method, route, code}
 	UpdatesTotal  *counterVec // {status}
 	ProviderTotal *counterVec // {provider, result}
+	CacheTotal    *counterVec // {result: hit|miss}
 
 	providerName         string
 	providerSecondsSum   atomic.Uint64 // биты float64 (CAS-обновление)
@@ -98,6 +99,7 @@ func New(provider string) *Metrics {
 		HTTPRequests:  newCounterVec("rates_http_requests_total", "Количество HTTP-запросов.", "method", "route", "code"),
 		UpdatesTotal:  newCounterVec("rates_updates_total", "Итоги фоновых обновлений котировок.", "status"),
 		ProviderTotal: newCounterVec("rates_provider_requests_total", "Вызовы внешнего провайдера котировок.", "provider", "result"),
+		CacheTotal:    newCounterVec("rates_provider_cache_total", "Попадания и промахи TTL-кэша провайдера.", "result"),
 		providerName:  provider,
 	}
 }
@@ -138,6 +140,18 @@ func (m *Metrics) ObserveProvider(d time.Duration, err error) {
 	m.providerSecondsCount.Add(1)
 }
 
+// ObserveProviderCache фиксирует попадание/промах TTL-кэша провайдера.
+func (m *Metrics) ObserveProviderCache(hit bool) {
+	if m == nil {
+		return
+	}
+	result := "miss"
+	if hit {
+		result = "hit"
+	}
+	m.CacheTotal.inc(result)
+}
+
 // Handler отдаёт метрики в текстовом формате Prometheus.
 func (m *Metrics) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -147,6 +161,7 @@ func (m *Metrics) Handler() http.Handler {
 		m.HTTPRequests.write(&buf)
 		m.UpdatesTotal.write(&buf)
 		m.ProviderTotal.write(&buf)
+		m.CacheTotal.write(&buf)
 
 		buf.WriteString("# HELP rates_provider_request_seconds Суммарное время вызовов провайдера.\n")
 		buf.WriteString("# TYPE rates_provider_request_seconds summary\n")

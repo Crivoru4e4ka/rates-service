@@ -22,6 +22,7 @@ type Config struct {
 	ProviderRetryBaseDelay time.Duration // базовая задержка перед повтором
 	ProviderRetryMaxDelay  time.Duration // потолок задержки между повторами
 	ProviderMinInterval    time.Duration // минимальный интервал между вызовами провайдера (глобально)
+	ProviderCacheTTL       time.Duration // TTL кэша ответов провайдера (0 — выключен)
 
 	SupportedCurrencies []string // допустимые валюты пар, напр. USD,EUR,MXN
 
@@ -67,6 +68,7 @@ func Load() (Config, error) {
 		ProviderRetryBaseDelay: envDuration("PROVIDER_RETRY_BASE_DELAY", 500*time.Millisecond),
 		ProviderRetryMaxDelay:  envDuration("PROVIDER_RETRY_MAX_DELAY", 10*time.Second),
 		ProviderMinInterval:    envDuration("PROVIDER_MIN_INTERVAL", 1*time.Second),
+		ProviderCacheTTL:       envDuration("PROVIDER_CACHE_TTL", 60*time.Second),
 
 		SupportedCurrencies: parseCurrencies(env("SUPPORTED_CURRENCIES", "USD,EUR,MXN")),
 

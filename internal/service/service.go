@@ -206,13 +206,12 @@ func (s *Service) worker() {
 
 // process выполняет одно фоновое обновление: обращается к провайдеру,
 // сохраняет котировку и переводит запрос в терминальный статус.
+// (Реальные вызовы провайдера и их длительность считает resilient-слой.)
 func (s *Service) process(req domain.UpdateRequest) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.opts.RequestTimeout)
 	defer cancel()
 
-	start := time.Now()
 	rate, err := s.provider.Rate(ctx, req.Pair)
-	s.metrics.ObserveProvider(time.Since(start), err)
 	if err != nil {
 		bgCtx, bgCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer bgCancel()

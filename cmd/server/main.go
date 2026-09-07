@@ -18,6 +18,7 @@ import (
 	"plata-rates/internal/httpapi"
 	"plata-rates/internal/metrics"
 	"plata-rates/internal/rates"
+	"plata-rates/internal/rates/cached"
 	"plata-rates/internal/rates/exchangeratesapi"
 	"plata-rates/internal/rates/frankfurter"
 	"plata-rates/internal/rates/resilient"
@@ -75,6 +76,15 @@ func run() error {
 		MaxDelay:    cfg.ProviderRetryMaxDelay,
 		MinInterval: cfg.ProviderMinInterval,
 		Logger:      logger,
+		Metrics:     m,
+	})
+	// TTL-кэш ответов: повторные запросы одной пары в пределах TTL не тратят
+	// квоту внешнего API. Кэш наружу от resilient — cache-hit не ждёт limiter
+	// и не тратит попытки ретрая.
+	provider = cached.New(provider, cached.Options{
+		TTL:     cfg.ProviderCacheTTL,
+		Logger:  logger,
+		Metrics: m,
 	})
 
 	svc := service.New(storage, provider, cfg.SupportedCurrencies, service.Options{

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"plata-rates/internal/domain"
+	"plata-rates/internal/metrics"
 	"plata-rates/internal/rates"
 )
 
@@ -20,12 +21,14 @@ type Options struct {
 	MaxDelay    time.Duration // потолок задержки между попытками
 	MinInterval time.Duration // минимальный интервал между вызовами провайдера (глобально)
 	Logger      *slog.Logger
+	Metrics     *metrics.Metrics // nil-safe; считает РЕАЛЬНЫЕ вызовы внутреннего провайдера
 }
 
 type Resilient struct {
-	inner  rates.Provider
-	opts   Options
-	logger *slog.Logger
+	inner   rates.Provider
+	opts    Options
+	logger  *slog.Logger
+	metrics *metrics.Metrics
 
 	mu          sync.Mutex
 	nextAllowed time.Time // ближайший момент, когда можно звонить провайдеру
@@ -48,7 +51,7 @@ func New(inner rates.Provider, opts Options) *Resilient {
 	if opts.MinInterval < 0 {
 		opts.MinInterval = 0
 	}
-	return &Resilient{inner: inner, opts: opts, logger: opts.Logger}
+	return &Resilient{inner: inner, opts: opts, logger: opts.Logger, metrics: opts.Metrics}
 }
 
 // Rate выполняет вызов провайдера с ограничением частоты и повторами.
@@ -59,7 +62,10 @@ func (r *Resilient) Rate(ctx context.Context, pair domain.Pair) (rates.Rate, err
 			return rates.Rate{}, err
 		}
 
+		start := time.Now()
 		rate, err := r.inner.Rate(ctx, pair)
+		// Считаются только реальные вызовы: TTL-кэш (снаружи) сюда не доходит.
+		r.metrics.ObserveProvider(time.Since(start), err)
 		if err == nil {
 			return rate, nil
 		}
