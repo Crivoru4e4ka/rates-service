@@ -20,6 +20,7 @@ import (
 	"plata-rates/internal/rates"
 	"plata-rates/internal/rates/cached"
 	"plata-rates/internal/rates/exchangeratesapi"
+	"plata-rates/internal/rates/fallback"
 	"plata-rates/internal/rates/frankfurter"
 	"plata-rates/internal/rates/resilient"
 	"plata-rates/internal/service"
@@ -67,21 +68,38 @@ func run() error {
 	storage := pgstorage.New(pool)
 	m := metrics.New(cfg.Provider)
 
-	provider := newProvider(cfg, logger)
-	// Resilience: глобальное ограничение частоты вызовов + повторы с backoff
-	// для транзистентных ошибок (429/403/5xx, сеть).
-	provider = resilient.New(provider, resilient.Options{
+	// Resilience у КАЖДОГО провайдера свой: ретраи не переносятся через
+	// фолбэк на другого провайдера. Глобальный limiter + backoff + метрики
+	// реальных вызовов.
+	resilientOpts := resilient.Options{
 		MaxAttempts: cfg.ProviderMaxAttempts,
 		BaseDelay:   cfg.ProviderRetryBaseDelay,
 		MaxDelay:    cfg.ProviderRetryMaxDelay,
 		MinInterval: cfg.ProviderMinInterval,
 		Logger:      logger,
 		Metrics:     m,
-	})
+	}
+	var primary rates.Provider = resilient.New(newProvider(cfg, logger), resilientOpts)
+
+	// Автоматический фолбэк (всегда включён): если основной провайдер вернул
+	// ошибку после своих ретраев, запрос уходит к резервному — если тот
+	// применим. Оба источника отдают курсы ЕЦБ, поэтому переключение
+	// семантически прозрачно.
+	secondary := newSecondaryProvider(cfg, logger)
+	if secondary != nil {
+		secondary = resilient.New(secondary, resilientOpts)
+		primary = fallback.New(primary, secondary, fallback.Options{
+			Logger:        logger,
+			Metrics:       m,
+			PrimaryName:   cfg.Provider,
+			SecondaryName: secondaryName(cfg.Provider),
+		})
+	}
+
 	// TTL-кэш ответов: повторные запросы одной пары в пределах TTL не тратят
-	// квоту внешнего API. Кэш наружу от resilient — cache-hit не ждёт limiter
-	// и не тратит попытки ретрая.
-	provider = cached.New(provider, cached.Options{
+	// квоту внешнего API. Кэш СНАРУЖИ остальных — cache-hit не ждёт limiter,
+	// не тратит ретраи и не вызывает фолбэк.
+	provider := cached.New(primary, cached.Options{
 		TTL:     cfg.ProviderCacheTTL,
 		Logger:  logger,
 		Metrics: m,
@@ -151,6 +169,31 @@ func newProvider(cfg config.Config, logger *slog.Logger) rates.Provider {
 	default: // frankfurter
 		return frankfurter.New(cfg.RatesAPIURL, cfg.ProviderTimeout, logger)
 	}
+}
+
+// secondaryName — имя резервного провайдера (для логов и метрики фолбэка).
+func secondaryName(primary string) string {
+	if primary == "frankfurter" {
+		return exchangeratesapi.SourceName
+	}
+	return frankfurter.SourceName
+}
+
+// newSecondaryProvider — резервный провайдер: «другой» относительно
+// основного. exchangeratesapi применим только при непустом RATES_API_KEY.
+// Резервный всегда использует канонический URL своего API —
+// RATES_API_URL переопределяет только основного провайдера.
+func newSecondaryProvider(cfg config.Config, logger *slog.Logger) rates.Provider {
+	switch cfg.Provider {
+	case "exchangeratesapi":
+		return frankfurter.New("https://api.frankfurter.dev/v1", cfg.ProviderTimeout, logger)
+	case "frankfurter":
+		if cfg.RatesAPIKey == "" {
+			return nil // exchangeratesapi без ключа неработоспособен
+		}
+		return exchangeratesapi.New("https://api.exchangeratesapi.io/v1", cfg.RatesAPIKey, cfg.ProviderTimeout, logger)
+	}
+	return nil
 }
 
 func newLogger(cfg config.Config) *slog.Logger {
